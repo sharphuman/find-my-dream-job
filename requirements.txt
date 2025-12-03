@@ -2,3 +2,5 @@ streamlit
 openai
 requests
 pandas
+beautifulsoup4
+openpyxl
