@@ -6,6 +6,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from openai import OpenAI
+from googleapiclient.discovery import build
 import json
 from bs4 import BeautifulSoup
 import io
@@ -17,18 +18,26 @@ ADZUNA_APP_ID = st.secrets["ADZUNA_APP_ID"]
 ADZUNA_APP_KEY = st.secrets["ADZUNA_APP_KEY"]
 GMAIL_USER = st.secrets["GMAIL_USER"]
 GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
+SEARCH_ENGINE_ID = st.secrets.get("SEARCH_ENGINE_ID")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- CONFIG: COUNTRY MAPPING ---
-# If AI detects "EU", we expand it to these tech hubs
-EU_EXPANSION = ["gb", "de", "fr", "nl", "it", "es"]
+# --- TARGET LISTS ---
+# Tier 1 targets (Add more here to customize your "Dream" list)
+TIER_1_DOMAINS = [
+    "careers.microsoft.com", "amazon.jobs", "careers.google.com", 
+    "netflix.com/jobs", "careers.apple.com", "meta.com/careers",
+    "careers.deloitte.com", "accenture.com", "capgemini.com",
+    "mckinsey.com/careers", "bcg.com/careers", "bain.com/careers",
+    "dgrsystems.com", "bedroc.com", "salesforce.com/company/careers",
+    "oracle.com/careers", "cisco.com/c/en/us/about/careers"
+]
+
 COUNTRY_MAP = {
-    "usa": "us", "us": "us", "united states": "us",
-    "australia": "au", "oz": "au", "au": "au",
-    "uk": "gb", "britain": "gb", "england": "gb",
-    "canada": "ca", "germany": "de", "france": "fr",
-    "netherlands": "nl", "india": "in"
+    "usa": "us", "united states": "us", "australia": "au", 
+    "uk": "gb", "germany": "de", "canada": "ca", "france": "fr",
+    "netherlands": "nl"
 }
 
 # --- HELPER FUNCTIONS ---
@@ -43,10 +52,9 @@ def extract_text_from_pdf(uploaded_file):
     except: return ""
 
 # --- AI BRAIN ---
-
 def parse_user_intent(dream_desc, resume_text):
     """
-    Extracts MULTIPLE countries and MULTIPLE search terms to create a broader net.
+    Analyzes user intent to generate Search Keywords + Country List.
     """
     prompt = f"""
     You are a Global Headhunter. Plan a search strategy.
@@ -55,16 +63,11 @@ def parse_user_intent(dream_desc, resume_text):
     USER RESUME: "{resume_text[:2000]}"
     
     TASK:
-    1. Keywords: Generate 3 DISTINCT boolean search phrases (e.g. "Senior Systems Engineer", "Active Directory Architect", "Windows Tech Lead").
-    2. Countries: Identify target country codes (us, gb, au, ca, de, fr, nl, in, za). If user says "EU", include 'de', 'fr', 'nl'.
+    1. Keywords: Generate 3 DISTINCT boolean search phrases (e.g. "Senior Systems Engineer", "Active Directory Architect").
+    2. Countries: Identify target country codes (us, gb, au, ca, de). Default to 'us' if unsure.
     3. Remote: Boolean.
     
-    OUTPUT JSON:
-    {{
-        "keywords": ["term1", "term2", "term3"],
-        "countries": ["us", "au", ...],
-        "is_remote": true/false
-    }}
+    OUTPUT JSON: {{ "keywords": [], "countries": [], "is_remote": true/false }}
     """
     try:
         response = client.chat.completions.create(
@@ -76,19 +79,21 @@ def parse_user_intent(dream_desc, resume_text):
     except: return None
 
 def ai_analyze_job(job, dream_desc, resume_text):
+    """
+    Vibe Check: Rates the job against the user's specific dream.
+    """
     prompt = f"""
     Rate this job for the user.
-    
     USER WANTS: "{dream_desc}"
     USER SKILLS: "{resume_text[:1000]}"
     
-    JOB: {job['Title']} @ {job['Company']} in {job['Location']}
+    JOB: {job['Title']} @ {job['Company']}
     DESC: {job['Description'][:1000]}
     
     TASK:
     1. Score (0-100).
     2. Estimate Salary (e.g. "$120k").
-    3. Extract Travel/Remote/Visa logic.
+    3. Reason (1 short sentence).
     
     OUTPUT JSON: "score" (int), "salary_est" (str), "reason" (str).
     """
@@ -102,20 +107,22 @@ def ai_analyze_job(job, dream_desc, resume_text):
     except:
         return {"score": 0, "salary_est": "N/A", "reason": "Error"}
 
-# --- SEARCH ENGINE (GLOBAL) ---
+# --- SEARCH ENGINES ---
 
 def search_adzuna(term, country):
     """
-    Searches a specific keyword in a specific country.
+    Aggregator Search - NOW FILTERED FOR FRESHNESS
     """
     results = []
     base_url = f"http://api.adzuna.com/v1/api/jobs/{country}/search/1"
     
     params = {
-        'app_id': ADZUNA_APP_ID, 'app_key': ADZUNA_APP_KEY,
-        'results_per_page': 10,
+        'app_id': ADZUNA_APP_ID, 
+        'app_key': ADZUNA_APP_KEY,
+        'results_per_page': 15, 
         'what': term, 
-        'sort_by': 'date', # <--- CRITICAL: Get fresh jobs, not just "relevant" ones
+        'sort_by': 'date',      # <--- FORCE NEWEST JOBS
+        'max_days_old': 21,     # <--- KILL OLD CRAPPY JOBS (3 weeks max)
         'content-type': 'application/json'
     }
     try:
@@ -129,51 +136,94 @@ def search_adzuna(term, country):
                 'Salary': item.get('salary_min', '0'),
                 'Description': item.get('description', ''),
                 'URL': item.get('redirect_url'),
-                'Source': f'Adzuna-{country.upper()}'
+                'Source': 'Adzuna (Fresh)'
             })
     except: pass
     return results
 
-def run_global_search(criteria):
+def search_tier_1_google(term, country_name):
+    """
+    X-Ray Search against Tier 1 Career Sites (Microsoft, Google, etc.)
+    """
+    if not GOOGLE_API_KEY: return []
+    
+    service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
+    results = []
+    
+    # Chunk domains to avoid query length limits
+    domain_chunks = [TIER_1_DOMAINS[i:i + 5] for i in range(0, len(TIER_1_DOMAINS), 5)]
+    
+    for chunk in domain_chunks:
+        # Construct Query: (site:microsoft.com OR site:google.com) "Systems Engineer" "USA"
+        site_operator = " OR ".join([f"site:{d}" for d in chunk])
+        query = f"({site_operator}) {term} {country_name}"
+        
+        try:
+            # We fetch 5 results per chunk to keep it fast
+            res = service.cse().list(q=query, cx=SEARCH_ENGINE_ID, num=5).execute()
+            for item in res.get('items', []):
+                title = item['title'].split("|")[0].split("-")[0].strip()
+                results.append({
+                    'Title': title,
+                    'Company': item['displayLink'], 
+                    'Location': country_name, 
+                    'Salary': 'Check Site',
+                    'Description': item['snippet'],
+                    'URL': item['link'],
+                    'Source': 'Tier 1 (Direct)'
+                })
+        except: pass
+        
+    return results
+
+def run_hybrid_search(criteria):
     all_results = []
     seen_urls = set()
     
-    # LIMITS: To prevent API timeouts, we limit combinations
-    # 3 Keywords x 3 Countries = 9 API Calls.
-    target_countries = criteria.get('countries', ['us'])[:4] 
-    target_keywords = criteria.get('keywords', [])[:3]
+    target_countries = criteria.get('countries', ['us'])[:3] # Max 3 countries
+    target_keywords = criteria.get('keywords', [])[:2]       # Max 2 keyword variations
     
+    progress = st.empty()
+    
+    # THE HYBRID LOOP: For every country & keyword, we scan BOTH sources.
     for country in target_countries:
-        # Normalize country code
         c_code = COUNTRY_MAP.get(country.lower(), country.lower())
-        if c_code not in COUNTRY_MAP.values(): continue # Skip invalid codes
         
         for term in target_keywords:
-            jobs = search_adzuna(term, c_code)
+            progress.text(f"🔍 Scanning {country.upper()}: '{term}' on Adzuna & Tier 1 sites...")
             
-            # Deduplicate
-            for j in jobs:
+            # 1. Adzuna (Freshness Filtered)
+            jobs_adz = search_adzuna(term, c_code)
+            
+            # 2. Tier 1 (Google X-Ray) - Always runs now
+            jobs_t1 = search_tier_1_google(term, country)
+            
+            # Combine & Deduplicate
+            for j in jobs_adz + jobs_t1:
                 if j['URL'] not in seen_urls:
                     seen_urls.add(j['URL'])
                     all_results.append(j)
-                    
+    
+    progress.empty()
     return all_results
 
 # --- EMAIL ---
 def send_jobs_email(user_email, df):
     msg = MIMEMultipart()
-    msg['Subject'] = f"Global Job Search Results ({len(df)})"
+    msg['Subject'] = f"Hybrid Job Search Results ({len(df)})"
     msg['From'] = GMAIL_USER
     msg['To'] = user_email
     
-    html = df[['Match %', 'Title', 'Company', 'Location', 'Salary Est.']].to_html(index=False)
-    msg.attach(MIMEText(f"<h3>Job Matches</h3>{html}", 'html'))
+    # HTML Table
+    html = df[['Match %', 'Title', 'Company', 'Source', 'Location']].to_html(index=False)
+    msg.attach(MIMEText(f"<h3>Your Job Report</h3>{html}", 'html'))
     
+    # Excel Attachment
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
         df.to_excel(writer, index=False)
-    part = MIMEApplication(excel_buffer.getvalue(), Name="Global_Jobs.xlsx")
-    part['Content-Disposition'] = 'attachment; filename="Global_Jobs.xlsx"'
+    part = MIMEApplication(excel_buffer.getvalue(), Name="Hybrid_Jobs.xlsx")
+    part['Content-Disposition'] = 'attachment; filename="Hybrid_Jobs.xlsx"'
     msg.attach(part)
     
     try:
@@ -184,47 +234,38 @@ def send_jobs_email(user_email, df):
     except: return False
 
 # --- UI ---
-st.set_page_config(page_title="Global Dream Job", page_icon="🌍", layout="wide")
-st.title("🌍 Global Dream Job Finder")
-st.markdown("I search **across borders** using variations of your job title to find the best matches.")
+st.set_page_config(page_title="Global Hybrid Hunter", page_icon="🌐", layout="wide")
+st.title("🌐 Global Hybrid Hunter")
+st.markdown("I scan **Job Aggregators** (for volume) AND **Tier 1 Career Sites** (for prestige) simultaneously.")
 
 with st.form("job_form"):
     c1, c2 = st.columns([1, 1])
     with c1:
-        dream_description = st.text_area("What do you want?", height=150, 
-            value="Senior Systems Engineer or Tech Lead. Windows & Active Directory. Remote with travel. $100k+. I have passports for USA, EU, and Australia.")
+        dream_description = st.text_area("Search Criteria", height=150, 
+            value="Senior Infrastructure Architect. Active Directory Migration. Remote/Travel. $130k+")
         uploaded_resume = st.file_uploader("Upload CV (PDF)", type=["pdf"])
     with c2:
         user_email = st.text_input("Email Results To", "judd@sharphuman.com")
-        st.info("ℹ️ I will auto-detect your target countries (USA, EU, AU) from your text.")
+        st.info("ℹ️ Filters: Jobs must be <21 days old. Searching US, EU, AU targets.")
 
-    submitted = st.form_submit_button("Run Global Search")
+    submitted = st.form_submit_button("Run Hybrid Search")
 
 if submitted:
-    # 1. Parse Resume
-    resume_text = ""
-    if uploaded_resume:
-        resume_text = extract_text_from_pdf(uploaded_resume)
-
-    status = st.status("Initializing Global Agent...", expanded=True)
+    resume_text = extract_text_from_pdf(uploaded_resume) if uploaded_resume else ""
+    status = st.status("Initializing Hybrid Agent...", expanded=True)
     
-    # 2. Plan Strategy
-    status.write("🧠 Planning search strategy...")
+    # 1. Plan
     criteria = parse_user_intent(dream_description, resume_text)
     
     if criteria:
-        kw_list = criteria['keywords']
-        ct_list = criteria['countries']
+        status.write(f"🗺️ Targets: **{criteria['countries']}**")
+        status.write(f"🔑 Keywords: **{criteria['keywords']}**")
         
-        status.write(f"🗺️ Target Countries: **{ct_list}**")
-        status.write(f"🔑 Search Terms: **{kw_list}**")
-        
-        # 3. Execute Search
-        status.write(f"🚀 Running {len(kw_list) * len(ct_list)} search combinations (Sorted by Freshness)...")
-        raw_jobs = run_global_search(criteria)
+        # 2. Execute Hybrid Search
+        raw_jobs = run_hybrid_search(criteria)
         
         if raw_jobs:
-            status.write(f"👀 Analyzing {len(raw_jobs)} candidates...")
+            status.write(f"👀 AI Scoring {len(raw_jobs)} candidates...")
             analyzed = []
             progress_bar = status.progress(0)
             
@@ -238,21 +279,23 @@ if submitted:
                 analyzed.append(j)
                 
             df = pd.DataFrame(analyzed)
-            df = df[df['Match %'] > 50].sort_values(by='Match %', ascending=False).head(25)
+            # Filter low scores
+            df = df[df['Match %'] > 50].sort_values(by='Match %', ascending=False).head(40)
             
             if not df.empty:
                 send_jobs_email(user_email, df)
                 status.update(label="✅ Done!", state="complete", expanded=False)
-                st.success("Sent to Email!")
+                st.success("Report Sent to Email!")
                 
                 for _, row in df.iterrows():
-                    with st.expander(f"{row['Match %']}% {row['Title']} ({row['Location']})"):
+                    with st.expander(f"{row['Match %']}% {row['Title']} ({row['Source']})"):
+                        st.write(f"**Company:** {row['Company']}")
                         st.write(f"**Reason:** {row['Reason']}")
                         st.write(f"**Salary:** {row['Salary Est.']}")
                         st.markdown(f"[Apply Now]({row['URL']})")
             else:
                 status.update(label="No high matches", state="error")
-                st.warning("Found jobs, but AI filtered them out based on your preferences.")
+                st.warning("Jobs found, but AI filtered them out based on your strict criteria.")
         else:
             status.update(label="No Jobs Found", state="error")
-            st.error("0 Jobs found across all countries.")
+            st.error("0 Jobs found. Try relaxing your keyword constraints.")
