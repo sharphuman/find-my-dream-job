@@ -5,3 +5,4 @@ pandas
 beautifulsoup4
 openpyxl
 pdfplumber
+google-api-python-client
